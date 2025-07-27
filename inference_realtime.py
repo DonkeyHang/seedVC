@@ -1,49 +1,159 @@
 import os
-
-import numpy as np
-
-os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
-import shutil
-import warnings
-import argparse
-import torch
-import yaml
-
-warnings.simplefilter('ignore')
-
-# load packages
-import random
-
-from modules.commons import *
+import sys
 import time
-
+import argparse
+import warnings
+import numpy as np
+import yaml
+import torch
+import torch.nn.functional as F
 import torchaudio
+import torchaudio.transforms as tat
 import librosa
+from tqdm import tqdm
+from modules.commons import *
+import torchaudio.compliance.kaldi as kaldi
+from hf_utils import load_custom_model_from_hf
 from modules.commons import str2bool
 
-from hf_utils import load_custom_model_from_hf
+warnings.simplefilter("ignore")
 
-# Load model and configuration
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+# 设置设备
+device = None
 
+# 全局变量
+prompt_condition, mel2, style2 = None, None, None
+reference_wav_name = ""
+prompt_len = 3  # 默认参考音频长度，单位为秒
+ce_dit_difference = 2.0  # 默认内容编码器与DiT的时间差，单位为秒
 fp16 = False
+
+@torch.no_grad()
+def custom_infer(model_set,
+                 reference_wav,
+                 new_reference_wav_name,
+                 input_wav_res,
+                 block_frame_16k,
+                 skip_head,
+                 skip_tail,
+                 return_length,
+                 diffusion_steps,
+                 inference_cfg_rate,
+                 max_prompt_length,
+                 cd_difference=2.0):
+    """
+    流式推理函数
+    """
+    global prompt_condition, mel2, style2
+    global reference_wav_name
+    global prompt_len
+    global ce_dit_difference
+    
+    (
+        model,
+        semantic_fn,
+        vocoder_fn,
+        campplus_model,
+        to_mel,
+        mel_fn_args,
+    ) = model_set
+    sr = mel_fn_args["sampling_rate"]
+    hop_length = mel_fn_args["hop_size"]
+    
+    if ce_dit_difference != cd_difference:
+        ce_dit_difference = cd_difference
+        print(f"设置ce_dit_difference为{cd_difference}秒")
+    
+    # 如果参考音频变化或首次运行，处理参考音频
+    if prompt_condition is None or reference_wav_name != new_reference_wav_name or prompt_len != max_prompt_length:
+        prompt_len = max_prompt_length
+        print(f"设置最大参考长度为{max_prompt_length}秒")
+        reference_wav = reference_wav[:int(sr * prompt_len)]
+        reference_wav_tensor = torch.from_numpy(reference_wav).to(device)
+
+        # 处理参考音频
+        ori_waves_16k = torchaudio.functional.resample(reference_wav_tensor, sr, 16000)
+        S_ori = semantic_fn(ori_waves_16k.unsqueeze(0))
+        feat2 = torchaudio.compliance.kaldi.fbank(
+            ori_waves_16k.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000
+        )
+        feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+        style2 = campplus_model(feat2.unsqueeze(0))
+
+        mel2 = to_mel(reference_wav_tensor.unsqueeze(0))
+        target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
+        prompt_condition = model.length_regulator(
+            S_ori, ylens=target2_lengths, n_quantizers=3, f0=None
+        )[0]
+
+        reference_wav_name = new_reference_wav_name
+
+    # 时间测量
+    if device.type == "mps":
+        start_event = torch.mps.event.Event(enable_timing=True)
+        end_event = torch.mps.event.Event(enable_timing=True)
+        torch.mps.synchronize()
+    else:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+
+    # 语义特征提取
+    start_event.record()
+    S_alt = semantic_fn(input_wav_res.unsqueeze(0))
+    end_event.record()
+    
+    if device.type == "mps":
+        torch.mps.synchronize()
+    else:
+        torch.cuda.synchronize()
+    
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    if prompt_condition is None:
+        print(f"语义特征提取耗时: {elapsed_time_ms}ms")
+
+    # 应用内容编码器与DiT的时间差
+    ce_dit_frame_difference = int(ce_dit_difference * 50)
+    S_alt = S_alt[:, ce_dit_frame_difference:]
+    target_lengths = torch.LongTensor([(skip_head + return_length + skip_tail - ce_dit_frame_difference) / 50 * sr // hop_length]).to(S_alt.device)
+    
+    # 生成条件
+    cond = model.length_regulator(
+        S_alt, ylens=target_lengths, n_quantizers=3, f0=None
+    )[0]
+    cat_condition = torch.cat([prompt_condition, cond], dim=1)
+    
+    # 使用条件流匹配进行推理
+    with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
+        vc_target = model.cfm.inference(
+            cat_condition,
+            torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
+            mel2,
+            style2,
+            None,
+            n_timesteps=diffusion_steps,
+            inference_cfg_rate=inference_cfg_rate,
+        )
+        vc_target = vc_target[:, :, mel2.size(-1):]
+        vc_wave = vocoder_fn(vc_target).squeeze()
+    
+    # 裁剪输出到所需长度
+    output_len = return_length * sr // 50
+    tail_len = skip_tail * sr // 50
+    output = vc_wave[-output_len - tail_len: -tail_len]
+
+    return output
+
 def load_models(args):
+    """
+    加载模型
+    """
     global fp16
     fp16 = args.fp16
     
     # 设置默认检查点和配置文件路径
-    if not args.f0_condition:
-        model_filename = "DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth"
-        config_filename = "config_dit_mel_seed_uvit_whisper_small_wavenet.yml"
-    else:
-        model_filename = "DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema.pth" 
-        config_filename = "config_dit_mel_seed_uvit_whisper_base_f0_44k.yml"
+    model_filename = "DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth"
+    config_filename = "config_dit_mel_seed_uvit_whisper_small_wavenet.yml"
     
     # 尝试多种路径寻找模型文件
     if args.checkpoint is None:
@@ -81,34 +191,7 @@ def load_models(args):
         dit_config_path = args.config
         print(f"✓ 使用指定的模型文件: {dit_checkpoint_path}")
     
-    # F0提取器设置
-    if not args.f0_condition:
-        f0_fn = None
-    else:
-        # 尝试加载F0提取器
-        from modules.rmvpe import RMVPE
-        
-        # 首先检查本地路径
-        local_rmvpe = "./checkpoints/rmvpe.pt"
-        if os.path.exists(local_rmvpe):
-            print(f"✓ 使用本地F0提取器: {local_rmvpe}")
-            model_path = local_rmvpe
-        else:
-            # 尝试从HF下载
-            print("本地F0提取器不存在，尝试从Hugging Face下载")
-            try:
-                model_path = load_custom_model_from_hf("lj1995/VoiceConversionWebUI", "rmvpe.pt", None)
-                print("✓ 成功下载F0提取器")
-            except Exception as e:
-                print(f"✗ 下载F0提取器失败: {e}")
-                print("\n请手动下载F0提取器:")
-                print("- 下载链接: https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt")
-                print("- 保存到: ./checkpoints/rmvpe.pt")
-                raise RuntimeError("无法加载F0提取器")
-        
-        f0_extractor = RMVPE(model_path, is_half=False, device=device)
-        f0_fn = f0_extractor.infer_from_audio
-
+    # 加载配置
     config = yaml.safe_load(open(dit_config_path, "r"))
     model_params = recursive_munch(config["model_params"])
     model_params.dit_type = 'DiT'
@@ -116,7 +199,7 @@ def load_models(args):
     hop_length = config["preprocess_params"]["spect_params"]["hop_length"]
     sr = config["preprocess_params"]["sr"]
 
-    # Load checkpoints
+    # 加载检查点
     model, _, _, _ = load_checkpoint(
         model,
         None,
@@ -130,7 +213,7 @@ def load_models(args):
         model[key].to(device)
     model.cfm.estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
 
-    # Load additional modules
+    # 加载CAMPPlus声纹提取器
     from modules.campplus.DTDNN import CAMPPlus
     
     # 首先检查本地路径
@@ -159,13 +242,14 @@ def load_models(args):
     campplus_model.eval()
     campplus_model.to(device)
 
+    # 加载声码器
     vocoder_type = model_params.vocoder.type
 
     if vocoder_type == 'bigvgan':
         from modules.bigvgan import bigvgan
         bigvgan_name = model_params.vocoder.name
         bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False)
-        # remove weight norm in the model and set to eval mode
+        # 移除模型中的weight norm并设置为eval模式
         bigvgan_model.remove_weight_norm()
         bigvgan_model = bigvgan_model.eval().to(device)
         vocoder_fn = bigvgan_model
@@ -208,11 +292,12 @@ def load_models(args):
         _ = [vocos[key].eval().to(device) for key in vocos]
         _ = [vocos[key].to(device) for key in vocos]
         total_params = sum(sum(p.numel() for p in vocos[key].parameters() if p.requires_grad) for key in vocos.keys())
-        print(f"Vocoder model total parameters: {total_params / 1_000_000:.2f}M")
+        print(f"声码器模型总参数量: {total_params / 1_000_000:.2f}M")
         vocoder_fn = vocos.decoder
     else:
-        raise ValueError(f"Unknown vocoder type: {vocoder_type}")
+        raise ValueError(f"未知声码器类型: {vocoder_type}")
 
+    # 加载语音内容编码器
     speech_tokenizer_type = model_params.speech_tokenizer.type
     if speech_tokenizer_type == 'whisper':
         # whisper
@@ -259,8 +344,6 @@ def load_models(args):
                     print(f"\n请手动下载Whisper模型:")
                     print(f"1. 访问: https://huggingface.co/{whisper_name}")
                     print(f"2. 下载模型文件并放入 {local_whisper_dir} 目录")
-                    print(f"或使用命令下载:")
-                    print(f"python -c \"from transformers import WhisperModel, AutoFeatureExtractor; WhisperModel.from_pretrained('{whisper_name}').save_pretrained('{local_whisper_dir}'); AutoFeatureExtractor.from_pretrained('{whisper_name}').save_pretrained('{local_whisper_dir}')\"")
                     raise RuntimeError("无法加载Whisper模型")
             
             del whisper_model.decoder
@@ -319,8 +402,6 @@ def load_models(args):
                 print(f"\n请手动下载HuBERT模型:")
                 print(f"1. 访问: https://huggingface.co/{hubert_model_name}")
                 print(f"2. 下载模型文件并放入 {local_hubert_dir} 目录")
-                print(f"或使用命令下载:")
-                print(f"python -c \"from transformers import HubertModel, Wav2Vec2FeatureExtractor; HubertModel.from_pretrained('{hubert_model_name}').save_pretrained('{local_hubert_dir}'); Wav2Vec2FeatureExtractor.from_pretrained('{hubert_model_name}').save_pretrained('{local_hubert_dir}')\"")
                 raise RuntimeError("无法加载HuBERT模型")
             
             hubert_model = hubert_model.to(device)
@@ -381,8 +462,6 @@ def load_models(args):
                 print(f"\n请手动下载XLSR模型:")
                 print(f"1. 访问: https://huggingface.co/{model_name}")
                 print(f"2. 下载模型文件并放入 {local_model_dir} 目录")
-                print(f"或使用命令下载:")
-                print(f"python -c \"from transformers import Wav2Vec2Model, Wav2Vec2FeatureExtractor; Wav2Vec2Model.from_pretrained('{model_name}').save_pretrained('{local_model_dir}'); Wav2Vec2FeatureExtractor.from_pretrained('{model_name}').save_pretrained('{local_model_dir}')\"")
                 raise RuntimeError("无法加载XLSR模型")
             
             # 限制encoder层数
@@ -418,8 +497,9 @@ def load_models(args):
             print(f"3. 然后重新运行程序")
             raise RuntimeError("无法加载XLSR模型")
     else:
-        raise ValueError(f"Unknown speech tokenizer type: {speech_tokenizer_type}")
-    # Generate mel spectrograms
+        raise ValueError(f"未知语音内容编码器类型: {speech_tokenizer_type}")
+        
+    # 生成mel频谱图
     mel_fn_args = {
         "n_fft": config['preprocess_params']['spect_params']['n_fft'],
         "win_size": config['preprocess_params']['spect_params']['win_length'],
@@ -437,18 +517,16 @@ def load_models(args):
     return (
         model,
         semantic_fn,
-        f0_fn,
         vocoder_fn,
         campplus_model,
         to_mel,
         mel_fn_args,
     )
 
-def adjust_f0_semitones(f0_sequence, n_semitones):
-    factor = 2 ** (n_semitones / 12)
-    return f0_sequence * factor
-
 def crossfade(chunk1, chunk2, overlap):
+    """
+    将两个音频块进行交叉淡化
+    """
     fade_out = np.cos(np.linspace(0, np.pi / 2, overlap)) ** 2
     fade_in = np.cos(np.linspace(np.pi / 2, 0, overlap)) ** 2
     if len(chunk2) < overlap:
@@ -459,170 +537,211 @@ def crossfade(chunk1, chunk2, overlap):
 
 @torch.no_grad()
 def main(args):
-    model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_fn_args = load_models(args)
-    sr = mel_fn_args['sampling_rate']
-    f0_condition = args.f0_condition
-    auto_f0_adjust = args.auto_f0_adjust
-    pitch_shift = args.semi_tone_shift
-
-    source = args.source
-    target_name = args.target
-    diffusion_steps = args.diffusion_steps
-    length_adjust = args.length_adjust
-    inference_cfg_rate = args.inference_cfg_rate
-    source_audio = librosa.load(source, sr=sr)[0]
-    ref_audio = librosa.load(target_name, sr=sr)[0]
-
-    sr = 22050 if not f0_condition else 44100
-    hop_length = 256 if not f0_condition else 512
-    max_context_window = sr // hop_length * 30
-    overlap_frame_len = 16
-    overlap_wave_len = overlap_frame_len * hop_length
-
-    # Process audio
-    source_audio = torch.tensor(source_audio).unsqueeze(0).float().to(device)
-    ref_audio = torch.tensor(ref_audio[:sr * 25]).unsqueeze(0).float().to(device)
-
-    time_vc_start = time.time()
-    # Resample
-    converted_waves_16k = torchaudio.functional.resample(source_audio, sr, 16000)
-    # if source audio less than 30 seconds, whisper can handle in one forward
-    if converted_waves_16k.size(-1) <= 16000 * 30:
-        S_alt = semantic_fn(converted_waves_16k)
+    """
+    主函数 - 使用流式处理方式处理音频文件
+    """
+    global device
+    start_time = time.time()
+    
+    # 设置设备
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.gpu}" if args.gpu else "cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
-        overlapping_time = 5  # 5 seconds
-        S_alt_list = []
-        buffer = None
-        traversed_time = 0
-        while traversed_time < converted_waves_16k.size(-1):
-            if buffer is None:  # first chunk
-                chunk = converted_waves_16k[:, traversed_time:traversed_time + 16000 * 30]
+        device = torch.device("cpu")
+    print(f"使用设备: {device}")
+    
+    # 加载模型
+    model_set = load_models(args)
+    sr = model_set[-1]["sampling_rate"]
+    
+    # 加载源音频和参考音频
+    print(f"加载源音频: {args.source}")
+    source_audio, _ = librosa.load(args.source, sr=sr)
+    print(f"加载参考音频: {args.target}")
+    reference_audio, _ = librosa.load(args.target, sr=sr)
+    
+    # 如果参考音频超过最大长度，截断
+    max_ref_length = int(args.max_prompt_length * sr)
+    if len(reference_audio) > max_ref_length:
+        reference_audio = reference_audio[:max_ref_length]
+    
+    # 打印音频信息
+    print(f"源音频长度: {len(source_audio)/sr:.2f}秒, 采样率: {sr}Hz")
+    print(f"参考音频长度: {len(reference_audio)/sr:.2f}秒, 采样率: {sr}Hz")
+    
+    # 设置块大小和交叉淡化参数
+    zc = sr // 50  # 基本时间单位
+    block_frame = int(np.round(args.block_time * sr / zc)) * zc
+    block_frame_16k = 320 * block_frame // zc
+    crossfade_frame = int(np.round(args.crossfade_time * sr / zc)) * zc
+    sola_buffer_frame = min(crossfade_frame, 4 * zc)
+    sola_search_frame = zc
+    extra_frame = int(np.round(args.extra_time_ce * sr / zc)) * zc
+    extra_frame_right = int(np.round(args.extra_time_right * sr / zc)) * zc
+    
+    # 确保源音频长度足够
+    if len(source_audio) < block_frame + extra_frame + extra_frame_right:
+        pad_length = block_frame + extra_frame + extra_frame_right - len(source_audio)
+        source_audio = np.pad(source_audio, (0, pad_length), 'constant')
+    
+    # 初始化SOLA算法的缓冲区
+    sola_buffer = torch.zeros(sola_buffer_frame, device=device, dtype=torch.float32)
+    
+    # 计算处理参数
+    skip_head = extra_frame // zc
+    skip_tail = extra_frame_right // zc
+    return_length = (block_frame + sola_buffer_frame + sola_search_frame) // zc
+    
+    # 创建淡入淡出窗口
+    fade_in_window = (
+        torch.sin(0.5 * np.pi * torch.linspace(0.0, 1.0, steps=sola_buffer_frame, device=device, dtype=torch.float32)) ** 2
+    )
+    fade_out_window = 1 - fade_in_window
+    
+    # 准备输出数组
+    output_chunks = []
+    total_blocks = 0
+    total_infer_time = 0
+    
+    # 分块处理音频
+    input_buffer = np.zeros(extra_frame + crossfade_frame + sola_search_frame + block_frame + extra_frame_right, dtype=np.float32)
+    
+    # 计算总块数
+    total_frames = len(source_audio)
+    num_blocks = (total_frames + block_frame - 1) // block_frame
+    
+    # 使用tqdm显示进度
+    print(f"开始流式处理，块大小: {block_frame/sr:.3f}秒, 总块数: {num_blocks}")
+    pbar = tqdm(total=num_blocks, desc="处理进度")
+    
+    for i in range(0, total_frames, block_frame):
+        # 准备当前块
+        end_idx = min(i + block_frame, total_frames)
+        current_block = source_audio[i:end_idx]
+        
+        # 如果当前块不足一个块大小，进行填充
+        if len(current_block) < block_frame:
+            current_block = np.pad(current_block, (0, block_frame - len(current_block)), 'constant')
+        
+        # 更新输入缓冲区
+        input_buffer[:-block_frame] = input_buffer[block_frame:]
+        input_buffer[-block_frame:] = current_block
+        
+        # 转换为torch张量并移至设备
+        input_wav = torch.from_numpy(input_buffer).to(device, dtype=torch.float32)
+        
+        # 重采样到16kHz
+        input_wav_res = torch.from_numpy(
+            librosa.resample(input_buffer, orig_sr=sr, target_sr=16000)
+        ).to(device, dtype=torch.float32)
+        
+        # 执行语音转换
+        infer_start = time.time()
+        infer_wav = custom_infer(
+            model_set,
+            reference_audio,
+            args.target,
+            input_wav_res,
+            block_frame_16k,
+            skip_head,
+            skip_tail,
+            return_length,
+            args.diffusion_steps,
+            args.inference_cfg_rate,
+            args.max_prompt_length,
+            args.extra_time_ce - args.extra_time,
+        )
+        infer_time = time.time() - infer_start
+        total_infer_time += infer_time
+        total_blocks += 1
+        
+        # SOLA算法处理
+        conv_input = infer_wav[None, None, :sola_buffer_frame + sola_search_frame]
+        cor_nom = F.conv1d(conv_input, sola_buffer[None, None, :])
+        cor_den = torch.sqrt(
+            F.conv1d(
+                conv_input**2,
+                torch.ones(1, 1, sola_buffer_frame, device=device),
+            ) + 1e-8
+        )
+        
+        tensor = cor_nom[0, 0] / cor_den[0, 0]
+        if tensor.numel() > 1:
+            if device.type == "mps":
+                _, sola_offset = torch.max(tensor, dim=0)
+                sola_offset = sola_offset.item()
             else:
-                chunk = torch.cat(
-                    [buffer, converted_waves_16k[:, traversed_time:traversed_time + 16000 * (30 - overlapping_time)]],
-                    dim=-1)
-            S_alt = semantic_fn(chunk)
-            if traversed_time == 0:
-                S_alt_list.append(S_alt)
-            else:
-                S_alt_list.append(S_alt[:, 50 * overlapping_time:])
-            buffer = chunk[:, -16000 * overlapping_time:]
-            traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
-        S_alt = torch.cat(S_alt_list, dim=1)
-
-    ori_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
-    S_ori = semantic_fn(ori_waves_16k)
-
-    mel = mel_fn(source_audio.to(device).float())
-    mel2 = mel_fn(ref_audio.to(device).float())
-
-    target_lengths = torch.LongTensor([int(mel.size(2) * length_adjust)]).to(mel.device)
-    target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
-
-    feat2 = torchaudio.compliance.kaldi.fbank(ori_waves_16k,
-                                              num_mel_bins=80,
-                                              dither=0,
-                                              sample_frequency=16000)
-    feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
-    style2 = campplus_model(feat2.unsqueeze(0))
-
-    if f0_condition:
-        F0_ori = f0_fn(ori_waves_16k[0], thred=0.03)
-        F0_alt = f0_fn(converted_waves_16k[0], thred=0.03)
-
-        F0_ori = torch.from_numpy(F0_ori).to(device)[None]
-        F0_alt = torch.from_numpy(F0_alt).to(device)[None]
-
-        voiced_F0_ori = F0_ori[F0_ori > 1]
-        voiced_F0_alt = F0_alt[F0_alt > 1]
-
-        log_f0_alt = torch.log(F0_alt + 1e-5)
-        voiced_log_f0_ori = torch.log(voiced_F0_ori + 1e-5)
-        voiced_log_f0_alt = torch.log(voiced_F0_alt + 1e-5)
-        median_log_f0_ori = torch.median(voiced_log_f0_ori)
-        median_log_f0_alt = torch.median(voiced_log_f0_alt)
-
-        # shift alt log f0 level to ori log f0 level
-        shifted_log_f0_alt = log_f0_alt.clone()
-        if auto_f0_adjust:
-            shifted_log_f0_alt[F0_alt > 1] = log_f0_alt[F0_alt > 1] - median_log_f0_alt + median_log_f0_ori
-        shifted_f0_alt = torch.exp(shifted_log_f0_alt)
-        if pitch_shift != 0:
-            shifted_f0_alt[F0_alt > 1] = adjust_f0_semitones(shifted_f0_alt[F0_alt > 1], pitch_shift)
-    else:
-        F0_ori = None
-        F0_alt = None
-        shifted_f0_alt = None
-
-    # Length regulation
-    cond, _, codes, commitment_loss, codebook_loss = model.length_regulator(S_alt, ylens=target_lengths,
-                                                                                       n_quantizers=3,
-                                                                                       f0=shifted_f0_alt)
-    prompt_condition, _, codes, commitment_loss, codebook_loss = model.length_regulator(S_ori,
-                                                                                       ylens=target2_lengths,
-                                                                                       n_quantizers=3,
-                                                                                       f0=F0_ori)
-
-    max_source_window = max_context_window - mel2.size(2)
-    # split source condition (cond) into chunks
-    processed_frames = 0
-    generated_wave_chunks = []
-    # generate chunk by chunk and stream the output
-    while processed_frames < cond.size(1):
-        chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
-        is_last_chunk = processed_frames + max_source_window >= cond.size(1)
-        cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
-        with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
-            # Voice Conversion
-            vc_target = model.cfm.inference(cat_condition,
-                                                       torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
-                                                       mel2, style2, None, diffusion_steps,
-                                                       inference_cfg_rate=inference_cfg_rate)
-            vc_target = vc_target[:, :, mel2.size(-1):]
-        vc_wave = vocoder_fn(vc_target.float()).squeeze()
-        vc_wave = vc_wave[None, :]
-        if processed_frames == 0:
-            if is_last_chunk:
-                output_wave = vc_wave[0].cpu().numpy()
-                generated_wave_chunks.append(output_wave)
-                break
-            output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
-            generated_wave_chunks.append(output_wave)
-            previous_chunk = vc_wave[0, -overlap_wave_len:]
-            processed_frames += vc_target.size(2) - overlap_frame_len
-        elif is_last_chunk:
-            output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
-            generated_wave_chunks.append(output_wave)
-            processed_frames += vc_target.size(2) - overlap_frame_len
-            break
+                sola_offset = torch.argmax(tensor, dim=0).item()
         else:
-            output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(),
-                                    overlap_wave_len)
-            generated_wave_chunks.append(output_wave)
-            previous_chunk = vc_wave[0, -overlap_wave_len:]
-            processed_frames += vc_target.size(2) - overlap_frame_len
-    vc_wave = torch.tensor(np.concatenate(generated_wave_chunks))[None, :].float()
-    time_vc_end = time.time()
-    print(f"RTF: {(time_vc_end - time_vc_start) / vc_wave.size(-1) * sr}")
-
-    source_name = os.path.basename(source).split(".")[0]
-    target_name = os.path.basename(target_name).split(".")[0]
-    os.makedirs(args.output, exist_ok=True)
-    torchaudio.save(os.path.join(args.output, f"vc_{source_name}_{target_name}_{length_adjust}_{diffusion_steps}_{inference_cfg_rate}.wav"), vc_wave.cpu(), sr)
+            sola_offset = 0
+            
+        # 应用交叉淡化
+        infer_wav = infer_wav[sola_offset:]
+        infer_wav[:sola_buffer_frame] *= fade_in_window
+        infer_wav[:sola_buffer_frame] += sola_buffer * fade_out_window
+        
+        # 更新SOLA缓冲区
+        sola_buffer[:] = infer_wav[block_frame:block_frame + sola_buffer_frame]
+        
+        # 添加处理后的块到输出
+        output_chunks.append(infer_wav[:block_frame].cpu().numpy())
+        
+        # 更新进度条
+        pbar.update(1)
+    
+    # 关闭进度条
+    pbar.close()
+    
+    # 合并所有输出块
+    final_output = np.concatenate(output_chunks)
+    
+    # 裁剪输出到与源音频相同的长度
+    final_output = final_output[:total_frames]
+    
+    # 保存结果
+    output_path = os.path.join(args.output, f"realtime_vc_{os.path.basename(args.source)}")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    torchaudio.save(output_path, torch.tensor(final_output).unsqueeze(0), sr)
+    
+    # 打印处理统计信息
+    total_time = time.time() - start_time
+    print(f"处理完成，总用时: {total_time:.2f}秒")
+    print(f"平均每块推理时间: {total_infer_time / total_blocks * 1000:.1f}毫秒")
+    print(f"实时系数 (RTF): {total_infer_time / (len(source_audio) / sr):.3f}")
+    print(f"输出文件保存至: {output_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=str, default="./examples/source/jay_0.wav")#origin
-    parser.add_argument("--target", type=str, default="./examples/reference/azuma_0.wav")#origin
-    parser.add_argument("--output", type=str, default="./reconstructed")#origin
-    parser.add_argument("--diffusion-steps", type=int, default=30)
-    parser.add_argument("--length-adjust", type=float, default=1.0)
-    parser.add_argument("--inference-cfg-rate", type=float, default=0.7)
-    parser.add_argument("--f0-condition", type=str2bool, default=False)
-    parser.add_argument("--auto-f0-adjust", type=str2bool, default=False)
-    parser.add_argument("--semi-tone-shift", type=int, default=0)
+    parser = argparse.ArgumentParser(description="使用流式处理进行语音转换")
+    
+    # 基本参数
+    parser.add_argument("--source", type=str, default="./examples/source/jay_0.wav", help="源音频文件路径")
+    parser.add_argument("--target", type=str, default="./examples/reference/azuma_0.wav", help="参考音频文件路径")
+    parser.add_argument("--output", type=str, default="./reconstructed", help="输出目录")
+    
+    # 模型参数
+    # parser.add_argument("--checkpoint", type=str, default=None, help="模型检查点路径")
+    # parser.add_argument("--config", type=str, default=None, help="模型配置文件路径")
     parser.add_argument("--checkpoint", type=str, help="", default="./checkpoints/DiT_uvit_tat_xlsr_ema.pth")#origin
     parser.add_argument("--config", type=str, help="", default="./configs/presets/config_dit_mel_seed_uvit_xlsr_tiny.yml")#origin
-    parser.add_argument("--fp16", type=str2bool, default=True)
+    parser.add_argument("--diffusion-steps", type=int, default=10, help="扩散步数")
+    parser.add_argument("--inference-cfg-rate", type=float, default=0.7, help="推理CFG率")
+    
+    # 流式处理参数
+    # parser.add_argument("--block-time", type=float, default=0.18, help="块时间(秒)")
+    parser.add_argument("--block-time", type=float, default=0.30, help="块时间(秒)")
+    # parser.add_argument("--crossfade-time", type=float, default=0.04, help="交叉淡化时间(秒)")
+    parser.add_argument("--crossfade-time", type=float, default=0.10, help="交叉淡化时间(秒)")
+    # parser.add_argument("--max-prompt-length", type=float, default=3.0, help="最大参考音频长度(秒)")
+    parser.add_argument("--max-prompt-length", type=float, default=5.0, help="最大参考音频长度(秒)")
+    parser.add_argument("--extra-time", type=float, default=0.5, help="额外DiT上下文时间(秒)")#0.5 feeling good
+    parser.add_argument("--extra-time-ce", type=float, default=2.5, help="额外内容编码器上下文时间(秒)")# is not have too much diff,i suggessed for 1.0
+    parser.add_argument("--extra-time-right", type=float, default=0.02, help="右侧额外上下文时间(秒)")
+    
+    # 其他参数
+    parser.add_argument("--fp16", type=str2bool, default=True, help="是否使用fp16")
+    parser.add_argument("--gpu", type=int, default=0, help="使用的GPU ID")
+    
     args = parser.parse_args()
     main(args)
