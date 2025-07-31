@@ -19,7 +19,7 @@ from modules.commons import str2bool
 warnings.simplefilter("ignore")
 
 # 设置设备
-device = None
+device = 'cpu'
 
 # 全局变量
 prompt_condition, mel2, style2 = None, None, None
@@ -42,7 +42,7 @@ def custom_infer(model_set,
                  max_prompt_length,
                  cd_difference=2.0):
     """
-    流式推理函数
+    streamble inference function for SeedVC
     """
     global prompt_condition, mel2, style2
     global reference_wav_name
@@ -94,23 +94,25 @@ def custom_infer(model_set,
         end_event = torch.mps.event.Event(enable_timing=True)
         torch.mps.synchronize()
     else:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
+        # start_event = torch.cuda.Event(enable_timing=True)
+        # end_event = torch.cuda.Event(enable_timing=True)
+        # torch.cuda.synchronize()
+        pass
 
     # 语义特征提取
-    start_event.record()
+    # start_event.record()
     S_alt = semantic_fn(input_wav_res.unsqueeze(0))
-    end_event.record()
+    # end_event.record()
     
     if device.type == "mps":
         torch.mps.synchronize()
     else:
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
+        pass
     
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    if prompt_condition is None:
-        print(f"语义特征提取耗时: {elapsed_time_ms}ms")
+    # elapsed_time_ms = start_event.elapsed_time(end_event)
+    # if prompt_condition is None:
+    #     print(f"语义特征提取耗时: {elapsed_time_ms}ms")
 
     # 应用内容编码器与DiT的时间差
     ce_dit_frame_difference = int(ce_dit_difference * 50)
@@ -544,14 +546,16 @@ def main(args):
     start_time = time.time()
     
     # 设置设备
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{args.gpu}" if args.gpu else "cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"使用设备: {device}")
-    
+    # if torch.cuda.is_available():
+    #     device = torch.device(f"cuda:{args.gpu}" if args.gpu else "cuda")
+    # elif torch.backends.mps.is_available():
+    #     device = torch.device("mps")
+    # else:
+    #     device = torch.device("cpu")
+    # print(f"使用设备: {device}")
+    device = torch.device("cpu")
+
+
     # 加载模型
     model_set = load_models(args)
     sr = model_set[-1]["sampling_rate"]
