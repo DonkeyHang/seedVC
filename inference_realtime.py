@@ -247,15 +247,7 @@ def load_models(args):
     # 加载声码器
     vocoder_type = model_params.vocoder.type
 
-    if vocoder_type == 'bigvgan':
-        from modules.bigvgan import bigvgan
-        bigvgan_name = model_params.vocoder.name
-        bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False)
-        # 移除模型中的weight norm并设置为eval模式
-        bigvgan_model.remove_weight_norm()
-        bigvgan_model = bigvgan_model.eval().to(device)
-        vocoder_fn = bigvgan_model
-    elif vocoder_type == 'hifigan':
+    if vocoder_type == 'hifigan':
         from modules.hifigan.generator import HiFTGenerator
         from modules.hifigan.f0_predictor import ConvRNNF0Predictor
         hift_config = yaml.safe_load(open('configs/hifigan.yml', 'r'))
@@ -283,155 +275,12 @@ def load_models(args):
         hift_gen.eval()
         hift_gen.to(device)
         vocoder_fn = hift_gen
-    elif vocoder_type == "vocos":
-        vocos_config = yaml.safe_load(open(model_params.vocoder.vocos.config, 'r'))
-        vocos_path = model_params.vocoder.vocos.path
-        vocos_model_params = recursive_munch(vocos_config['model_params'])
-        vocos = build_model(vocos_model_params, stage='mel_vocos')
-        vocos_checkpoint_path = vocos_path
-        vocos, _, _, _ = load_checkpoint(vocos, None, vocos_checkpoint_path,
-                                         load_only_params=True, ignore_modules=[], is_distributed=False)
-        _ = [vocos[key].eval().to(device) for key in vocos]
-        _ = [vocos[key].to(device) for key in vocos]
-        total_params = sum(sum(p.numel() for p in vocos[key].parameters() if p.requires_grad) for key in vocos.keys())
-        print(f"声码器模型总参数量: {total_params / 1_000_000:.2f}M")
-        vocoder_fn = vocos.decoder
     else:
         raise ValueError(f"未知声码器类型: {vocoder_type}")
 
     # 加载语音内容编码器
     speech_tokenizer_type = model_params.speech_tokenizer.type
-    if speech_tokenizer_type == 'whisper':
-        # whisper
-        from transformers import AutoFeatureExtractor, WhisperModel
-        whisper_name = model_params.speech_tokenizer.name
-        
-        # 检查本地路径
-        model_id = whisper_name.split('/')[-1] if '/' in whisper_name else whisper_name
-        local_whisper_dir = f"./checkpoints/{model_id}"
-        os.makedirs(local_whisper_dir, exist_ok=True)
-        
-        print(f"正在加载Whisper模型: {whisper_name}")
-        
-        try:
-            # 尝试从本地加载
-            try:
-                print(f"尝试从本地加载Whisper模型: {local_whisper_dir}")
-                whisper_model = WhisperModel.from_pretrained(
-                    local_whisper_dir, 
-                    torch_dtype=torch.float16,
-                    local_files_only=True
-                ).to(device)
-                print("✓ 成功从本地加载Whisper模型")
-                
-                whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    local_whisper_dir,
-                    local_files_only=True
-                )
-                print("✓ 成功从本地加载Whisper特征提取器")
-            except Exception as e:
-                print(f"✗ 从本地加载Whisper模型失败: {e}")
-                print(f"正在尝试从Hugging Face下载...")
-                
-                try:
-                    whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=torch.float16).to(device)
-                    whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_name)
-                    
-                    # 保存到本地以便下次使用
-                    print(f"保存Whisper模型到本地: {local_whisper_dir}")
-                    whisper_model.save_pretrained(local_whisper_dir)
-                    whisper_feature_extractor.save_pretrained(local_whisper_dir)
-                except Exception as e:
-                    print(f"✗ 下载Whisper模型失败: {e}")
-                    print(f"\n请手动下载Whisper模型:")
-                    print(f"1. 访问: https://huggingface.co/{whisper_name}")
-                    print(f"2. 下载模型文件并放入 {local_whisper_dir} 目录")
-                    raise RuntimeError("无法加载Whisper模型")
-            
-            del whisper_model.decoder
-            
-            def semantic_fn(waves_16k):
-                ori_inputs = whisper_feature_extractor([waves_16k.squeeze(0).cpu().numpy()],
-                                                       return_tensors="pt",
-                                                       return_attention_mask=True)
-                ori_input_features = whisper_model._mask_input_features(
-                    ori_inputs.input_features, attention_mask=ori_inputs.attention_mask).to(device)
-                with torch.no_grad():
-                    ori_outputs = whisper_model.encoder(
-                        ori_input_features.to(whisper_model.encoder.dtype),
-                        head_mask=None,
-                        output_attentions=False,
-                        output_hidden_states=False,
-                        return_dict=True,
-                    )
-                S_ori = ori_outputs.last_hidden_state.to(torch.float32)
-                S_ori = S_ori[:, :waves_16k.size(-1) // 320 + 1]
-                return S_ori
-                
-        except Exception as e:
-            print(f"加载Whisper模型失败: {e}")
-            raise RuntimeError("无法加载Whisper模型")
-            
-    elif speech_tokenizer_type == 'cnhubert':
-        from transformers import (
-            Wav2Vec2FeatureExtractor,
-            HubertModel,
-        )
-        hubert_model_name = config['model_params']['speech_tokenizer']['name']
-        
-        # 获取模型ID，用于本地文件命名
-        model_id = hubert_model_name.split('/')[-1] if '/' in hubert_model_name else hubert_model_name
-        local_hubert_dir = f"./checkpoints/{model_id}"
-        os.makedirs(local_hubert_dir, exist_ok=True)
-        
-        print(f"正在加载HuBERT模型: {hubert_model_name}")
-        
-        try:
-            # 尝试从本地加载
-            try:
-                print(f"尝试从本地加载HuBERT模型: {local_hubert_dir}")
-                hubert_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-                    local_hubert_dir, 
-                    local_files_only=True
-                )
-                hubert_model = HubertModel.from_pretrained(
-                    local_hubert_dir,
-                    local_files_only=True
-                )
-                print("✓ 成功从本地加载HuBERT模型")
-            except Exception as e:
-                print(f"✗ 从本地加载HuBERT模型失败: {e}")
-                print(f"\n请手动下载HuBERT模型:")
-                print(f"1. 访问: https://huggingface.co/{hubert_model_name}")
-                print(f"2. 下载模型文件并放入 {local_hubert_dir} 目录")
-                raise RuntimeError("无法加载HuBERT模型")
-            
-            hubert_model = hubert_model.to(device)
-            hubert_model = hubert_model.eval()
-            hubert_model = hubert_model.half()
-            
-            def semantic_fn(waves_16k):
-                ori_waves_16k_input_list = [
-                    waves_16k[bib].cpu().numpy()
-                    for bib in range(len(waves_16k))
-                ]
-                ori_inputs = hubert_feature_extractor(ori_waves_16k_input_list,
-                                                    return_tensors="pt",
-                                                    return_attention_mask=True,
-                                                    padding=True,
-                                                    sampling_rate=16000).to(device)
-                with torch.no_grad():
-                    ori_outputs = hubert_model(
-                        ori_inputs.input_values.half(),
-                    )
-                S_ori = ori_outputs.last_hidden_state.float()
-                return S_ori
-                
-        except Exception as e:
-            print(f"加载HuBERT模型失败: {e}")
-            raise RuntimeError("无法加载HuBERT模型")
-            
-    elif speech_tokenizer_type == 'xlsr':
+    if speech_tokenizer_type == 'xlsr':
         from transformers import (
             Wav2Vec2FeatureExtractor,
             Wav2Vec2Model,
