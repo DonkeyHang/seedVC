@@ -27,6 +27,7 @@ class BASECFM(torch.nn.Module, ABC):
         else:
             self.zero_prompt_speech_token = False
 
+    #inference：应用映射解ODE：dx/dt = v(x,t,condition)
     @torch.inference_mode()
     def inference(self, mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5):
         """Forward diffusion
@@ -110,6 +111,8 @@ class BASECFM(torch.nn.Module, ABC):
             x[:, :, :prompt_len] = 0
 
         return sol[-1]
+    
+    #forward：学习映射(y(t), t, condition) → v(t)
     def forward(self, x1, x_lens, prompt_lens, mu, style):
         """Computes diffusion loss
 
@@ -133,18 +136,18 @@ class BASECFM(torch.nn.Module, ABC):
         # random timestep
         t = torch.rand([b, 1, 1], device=mu.device, dtype=x1.dtype)
         # sample noise p(x_0)
-        z = torch.randn_like(x1)
+        z = torch.randn_like(x1)    #随机噪声
 
-        y = (1 - (1 - self.sigma_min) * t) * z + t * x1
-        u = x1 - (1 - self.sigma_min) * z
+        y = (1 - (1 - self.sigma_min) * t) * z + t * x1   #插值路径，y(t) = (1-αt)·noise + t·target
+        u = x1 - (1 - self.sigma_min) * z   #真实速度场，指向目标数据
 
         prompt = torch.zeros_like(x1)
         for bib in range(b):
-            prompt[bib, :, :prompt_lens[bib]] = x1[bib, :, :prompt_lens[bib]]
+            prompt[bib, :, :prompt_lens[bib]] = x1[bib, :, :prompt_lens[bib]]#提取prompt部分
             # range covered by prompt are set to 0
-            y[bib, :, :prompt_lens[bib]] = 0
+            y[bib, :, :prompt_lens[bib]] = 0#插值路径的prompt部分置0
             if self.zero_prompt_speech_token:
-                mu[bib, :, :prompt_lens[bib]] = 0
+                mu[bib, :, :prompt_lens[bib]] = 0#条件的prompt部分置0
 
         estimator_out = self.estimator(y, prompt, x_lens, t.squeeze(1).squeeze(1), style, mu, prompt_lens)
         loss = 0
